@@ -1,5 +1,5 @@
 const { MessageMedia, Location, Buttons, List, Poll } = require('whatsapp-web.js')
-const { sessions } = require('../sessions')
+const { sessions, sessionReactions, saveMessage } = require('../sessions')
 const { sendErrorResponse } = require('../utils')
 
 /**
@@ -67,8 +67,32 @@ const sendMessage = async (req, res) => {
   */
 
   try {
-    const { chatId, content, contentType, options } = req.body
+    let { chatId, content, contentType, options } = req.body
     const client = sessions.get(req.params.sessionId)
+
+    // Smart chatId formatting
+    if (typeof chatId === 'string') {
+      chatId = chatId.trim()
+      const isGroup = chatId.includes('@g.us')
+      const isNewsletter = chatId.includes('@newsletter')
+      
+      if (!isGroup && !isNewsletter) {
+        if (chatId.includes('@')) {
+          const parts = chatId.split('@')
+          let localPart = parts[0].replace(/\\D/g, '')
+          if (localPart.startsWith('08')) {
+            localPart = '62' + localPart.substring(1)
+          }
+          chatId = `${localPart}@${parts[1]}`
+        } else {
+          let localPart = chatId.replace(/\\D/g, '')
+          if (localPart.startsWith('08')) {
+            localPart = '62' + localPart.substring(1)
+          }
+          chatId = `${localPart}@c.us`
+        }
+      }
+    }
 
     let messageOut
     switch (contentType) {
@@ -121,7 +145,11 @@ const sendMessage = async (req, res) => {
         return sendErrorResponse(res, 404, 'contentType invalid, must be string, MessageMedia, MessageMediaFromURL, Location, Buttons, List, Contact or Poll')
     }
 
-    res.json({ success: true, message: messageOut })
+    const chatIdResult = messageOut?.id?.remote || (messageOut?.fromMe ? messageOut.to : messageOut?.from) || chatId
+    if (messageOut) {
+      saveMessage(req.params.sessionId, messageOut).catch(() => {})
+    }
+    res.json({ success: true, message: messageOut, chatId: chatIdResult })
   } catch (error) {
     console.log(error)
     sendErrorResponse(res, 500, error.message)
@@ -321,12 +349,33 @@ const getContacts = async (req, res) => {
  * @throws {Error} If the operation fails, an error is thrown.
  */
 const getChats = async (req, res) => {
+  const client = sessions.get(req.params.sessionId)
   try {
-    const client = sessions.get(req.params.sessionId)
-    const chats = await client.getChats()
-    res.json({ success: true, chats })
+    const chats = await client.pupPage.evaluate(async () => {
+      const raw = window.require('WAWebCollections').Chat.getModelsArray()
+      const result = []
+      for (let i = 0; i < raw.length; i++) {
+        try {
+          const c = raw[i]
+          let contactName = ''
+          try { contactName = c.contact ? (c.contact.name || c.contact.pushname || c.contact.formattedName || c.contact.shortName || '') : '' } catch (e) {}
+          result.push({
+            id: c.id?._serialized,
+            name: c.formattedTitle || c.name || contactName || c.id?._serialized,
+            isGroup: !!c.groupMetadata,
+            unreadCount: c.unreadCount || 0,
+            timestamp: c.t ? c.t.toString() : null,
+            isMuted: c.mute ? c.mute.expiration !== 0 : false,
+          })
+        } catch (e) {
+          result.push({ id: raw[i]?.id?._serialized || 'unknown', error: true })
+        }
+      }
+      return result
+    })
+    res.json({ success: true, chats, count: chats.length })
   } catch (error) {
-    sendErrorResponse(res, 500, error.message)
+    sendErrorResponse(res, 500, `getChats: ${error.message}`)
   }
 }
 
@@ -364,7 +413,7 @@ const getProfilePictureUrl = async (req, res) => {
     const result = await client.getProfilePicUrl(contactId)
     res.json({ success: true, result })
   } catch (error) {
-    sendErrorResponse(res, 500, error.message)
+    res.json({ success: true, result: null })
   }
 }
 
@@ -832,6 +881,108 @@ const getState = async (req, res) => {
   }
 }
 
+const debugContactNames = async (req, res) => {
+  try {
+    const client = sessions.get(req.params.sessionId)
+    const result = await client.pupPage.evaluate(() => {
+      const models = window.require('WAWebCollections').Contact.getModelsArray()
+      return models.slice(0, 10).map(m => ({
+        name: m.name,
+        pushname: m.pushname,
+        formattedName: m.formattedName,
+        shortName: m.shortName,
+        id: m.id?._serialized,
+      }))
+    })
+    res.json({ success: true, total: result.length, contacts: result })
+  } catch (error) {
+    sendErrorResponse(res, 500, error.message)
+  }
+}
+
+const getMessageReactions = async (req, res) => {
+  try {
+    const { chatId, messageId } = req.body
+    const sessionId = req.params.sessionId
+    const client = sessions.get(sessionId)
+    let reactions = []
+    const stored = sessionReactions.get(sessionId)?.get(messageId)
+    if (stored) reactions = stored
+    if (!reactions.length) {
+      try {
+        const result = await client.pupPage.evaluate(({ chatId, messageId }) => {
+          try {
+            const wid = window.require('WAWebWidFactory').createWid(chatId)
+            const chat = window.require('WAWebCollections').Chat.get(wid)
+            if (!chat || !chat.msgs || !chat.msgs.models) return []
+            const msg = chat.msgs.models.find(m => m.id?._serialized === messageId || m.id?.id === messageId)
+            if (!msg || !msg.reactions) return []
+            return msg.reactions.map(r => ({
+              emoji: r.emoji,
+              from: r.from?._serialized || r.from,
+              senderId: r.from?._serialized || r.from,
+              timestamp: r.timestamp || r.t,
+            }))
+          } catch (e) { return [] }
+        }, { chatId, messageId })
+        reactions = result || []
+      } catch (_) {}
+    }
+    res.json({ success: true, reactions })
+  } catch (error) {
+    sendErrorResponse(res, 500, error.message)
+  }
+}
+
+const sendReactionDirect = async (req, res) => {
+  try {
+    const { chatId, messageId, reaction } = req.body
+    const sessionId = req.params.sessionId
+    const client = sessions.get(sessionId)
+    const result = await client.pupPage.evaluate(async ({ chatId, messageId, reaction }) => {
+      try {
+        const msgStore = window.require('WAWebCollections').Msg
+        const wid = window.require('WAWebWidFactory').createWid(chatId)
+        const chat = window.require('WAWebCollections').Chat.get(wid)
+        let msg = null
+        let debug = {}
+        if (chat && chat.msgs && chat.msgs.models) {
+          msg = chat.msgs.models.find(m => m.id?.id === messageId || m.id?._serialized === messageId)
+          debug.inChatMsgs = !!msg
+          debug.msgsLen = chat.msgs.models.length
+        }
+        if (!msg) {
+          const byId = await msgStore.getMessagesById([messageId])
+          msg = byId?.messages?.[0]
+          debug.byIdMsgs = !!msg
+          debug.byIdRes = typeof byId
+        }
+        if (!msg) return { success: false, error: 'msg not found', debug }
+        await window.require('WAWebSendReactionMsgAction').sendReactionToMsg(msg, reaction)
+        return { success: true, debug }
+      } catch (e) {
+        return { success: false, error: e.message }
+      }
+    }, { chatId, messageId, reaction })
+    if (result?.success) {
+      if (!sessionReactions.has(sessionId)) sessionReactions.set(sessionId, new Map())
+      const map = sessionReactions.get(sessionId)
+      if (!map.has(messageId)) map.set(messageId, [])
+      const existing = map.get(messageId)
+      const idx = existing.findIndex(r => r.senderId === 'me')
+      if (idx >= 0) {
+        if (reaction) existing[idx].emoji = reaction
+        else existing.splice(idx, 1)
+      } else if (reaction) {
+        existing.push({ emoji: reaction, senderId: 'me', ts: Math.floor(Date.now() / 1000) })
+      }
+    }
+    res.json({ success: true, ...result })
+  } catch (error) {
+    sendErrorResponse(res, 500, error.message)
+  }
+}
+
 /**
  * Marks a chat as unread.
  *
@@ -1275,7 +1426,504 @@ const setProfilePicture = async (req, res) => {
   }
 }
 
+
+
+const getContactLidAndPhone = async (req, res) => {
+  /*
+    #swagger.requestBody = {
+      required: true,
+      schema: {
+        type: 'object',
+        properties: {
+          userIds: {
+            type: 'array',
+            description: 'Array of user IDs to get LID and phone number for',
+            example: ['6281288888888@c.us']
+          }
+        }
+      }
+    }
+  */
+  try {
+    const { userIds } = req.body
+    const client = sessions.get(req.params.sessionId)
+    const result = await client.getContactLidAndPhone(userIds)
+    res.json({ success: true, result })
+  } catch (error) {
+    sendErrorResponse(res, 500, error.message)
+  }
+}
+
+const sendReaction = async (req, res) => {
+  try {
+    const { messageId, reaction } = req.body
+    const client = sessions.get(req.params.sessionId)
+    const result = await client.sendReaction(messageId, reaction)
+    res.json({ success: true, result })
+  } catch (error) {
+    sendErrorResponse(res, 500, error.message)
+  }
+}
+
+const requestPairingCode = async (req, res) => {
+  try {
+    const { phoneNumber } = req.body
+    const client = sessions.get(req.params.sessionId)
+    const code = await client.requestPairingCode(phoneNumber)
+    res.json({ success: true, code })
+  } catch (error) {
+    sendErrorResponse(res, 500, error.message)
+  }
+}
+
+const cancelPairingCode = async (req, res) => {
+  try {
+    const client = sessions.get(req.params.sessionId)
+    await client.cancelPairingCode()
+    res.json({ success: true })
+  } catch (error) {
+    sendErrorResponse(res, 500, error.message)
+  }
+}
+
+const getChannels = async (req, res) => {
+  try {
+    const client = sessions.get(req.params.sessionId)
+    const channels = await client.getChannels()
+    res.json({ success: true, channels })
+  } catch (error) {
+    sendErrorResponse(res, 500, error.message)
+  }
+}
+
+const getChannelByInviteCode = async (req, res) => {
+  try {
+    const { inviteCode } = req.body
+    const client = sessions.get(req.params.sessionId)
+    const channel = await client.getChannelByInviteCode(inviteCode)
+    res.json({ success: true, channel })
+  } catch (error) {
+    sendErrorResponse(res, 500, error.message)
+  }
+}
+
+const sendChannelAdminInvite = async (req, res) => {
+  try {
+    const { chatId, channelId, options } = req.body
+    const client = sessions.get(req.params.sessionId)
+    const result = await client.sendChannelAdminInvite(chatId, channelId, options)
+    res.json({ success: true, result })
+  } catch (error) {
+    sendErrorResponse(res, 500, error.message)
+  }
+}
+
+const acceptChannelAdminInvite = async (req, res) => {
+  try {
+    const { channelId } = req.body
+    const client = sessions.get(req.params.sessionId)
+    const result = await client.acceptChannelAdminInvite(channelId)
+    res.json({ success: true, result })
+  } catch (error) {
+    sendErrorResponse(res, 500, error.message)
+  }
+}
+
+const revokeChannelAdminInvite = async (req, res) => {
+  try {
+    const { channelId, userId } = req.body
+    const client = sessions.get(req.params.sessionId)
+    const result = await client.revokeChannelAdminInvite(channelId, userId)
+    res.json({ success: true, result })
+  } catch (error) {
+    sendErrorResponse(res, 500, error.message)
+  }
+}
+
+const demoteChannelAdmin = async (req, res) => {
+  try {
+    const { channelId, userId } = req.body
+    const client = sessions.get(req.params.sessionId)
+    const result = await client.demoteChannelAdmin(channelId, userId)
+    res.json({ success: true, result })
+  } catch (error) {
+    sendErrorResponse(res, 500, error.message)
+  }
+}
+
+const getMessageById = async (req, res) => {
+  try {
+    const { messageId } = req.body
+    const client = sessions.get(req.params.sessionId)
+    const message = await client.getMessageById(messageId)
+    res.json({ success: true, message })
+  } catch (error) {
+    sendErrorResponse(res, 500, error.message)
+  }
+}
+
+const getPinnedMessages = async (req, res) => {
+  try {
+    const { chatId } = req.body
+    const client = sessions.get(req.params.sessionId)
+    const messages = await client.getPinnedMessages(chatId)
+    res.json({ success: true, messages })
+  } catch (error) {
+    sendErrorResponse(res, 500, error.message)
+  }
+}
+
+const acceptGroupV4Invite = async (req, res) => {
+  try {
+    const { inviteInfo } = req.body
+    const client = sessions.get(req.params.sessionId)
+    const result = await client.acceptGroupV4Invite(inviteInfo)
+    res.json({ success: true, result })
+  } catch (error) {
+    sendErrorResponse(res, 500, error.message)
+  }
+}
+
+const getFormattedNumber = async (req, res) => {
+  try {
+    const { number } = req.body
+    const client = sessions.get(req.params.sessionId)
+    const result = await client.getFormattedNumber(number)
+    res.json({ success: true, result })
+  } catch (error) {
+    sendErrorResponse(res, 500, error.message)
+  }
+}
+
+const getCountryCode = async (req, res) => {
+  try {
+    const { number } = req.body
+    const client = sessions.get(req.params.sessionId)
+    const result = await client.getCountryCode(number)
+    res.json({ success: true, result })
+  } catch (error) {
+    sendErrorResponse(res, 500, error.message)
+  }
+}
+
+const getBroadcasts = async (req, res) => {
+  try {
+    const client = sessions.get(req.params.sessionId)
+    const broadcasts = await client.getBroadcasts()
+    res.json({ success: true, broadcasts })
+  } catch (error) {
+    sendErrorResponse(res, 500, error.message)
+  }
+}
+
+const getBroadcastById = async (req, res) => {
+  try {
+    const { contactId } = req.body
+    const client = sessions.get(req.params.sessionId)
+    const broadcast = await client.getBroadcastById(contactId)
+    res.json({ success: true, broadcast })
+  } catch (error) {
+    sendErrorResponse(res, 500, error.message)
+  }
+}
+
+const revokeStatusMessage = async (req, res) => {
+  try {
+    const { messageId } = req.body
+    const client = sessions.get(req.params.sessionId)
+    const result = await client.revokeStatusMessage(messageId)
+    res.json({ success: true, result })
+  } catch (error) {
+    sendErrorResponse(res, 500, error.message)
+  }
+}
+
+const getGroupMembershipRequests = async (req, res) => {
+  try {
+    const { groupId } = req.body
+    const client = sessions.get(req.params.sessionId)
+    const requests = await client.getGroupMembershipRequests(groupId)
+    res.json({ success: true, requests })
+  } catch (error) {
+    sendErrorResponse(res, 500, error.message)
+  }
+}
+
+const approveGroupMembershipRequests = async (req, res) => {
+  try {
+    const { groupId, options } = req.body
+    const client = sessions.get(req.params.sessionId)
+    const result = await client.approveGroupMembershipRequests(groupId, options)
+    res.json({ success: true, result })
+  } catch (error) {
+    sendErrorResponse(res, 500, error.message)
+  }
+}
+
+const rejectGroupMembershipRequests = async (req, res) => {
+  try {
+    const { groupId, options } = req.body
+    const client = sessions.get(req.params.sessionId)
+    const result = await client.rejectGroupMembershipRequests(groupId, options)
+    res.json({ success: true, result })
+  } catch (error) {
+    sendErrorResponse(res, 500, error.message)
+  }
+}
+
+const setAutoDownloadAudio = async (req, res) => {
+  try {
+    const { flag } = req.body
+    const client = sessions.get(req.params.sessionId)
+    await client.setAutoDownloadAudio(flag)
+    res.json({ success: true })
+  } catch (error) {
+    sendErrorResponse(res, 500, error.message)
+  }
+}
+
+const setAutoDownloadDocuments = async (req, res) => {
+  try {
+    const { flag } = req.body
+    const client = sessions.get(req.params.sessionId)
+    await client.setAutoDownloadDocuments(flag)
+    res.json({ success: true })
+  } catch (error) {
+    sendErrorResponse(res, 500, error.message)
+  }
+}
+
+const setAutoDownloadPhotos = async (req, res) => {
+  try {
+    const { flag } = req.body
+    const client = sessions.get(req.params.sessionId)
+    await client.setAutoDownloadPhotos(flag)
+    res.json({ success: true })
+  } catch (error) {
+    sendErrorResponse(res, 500, error.message)
+  }
+}
+
+const setAutoDownloadVideos = async (req, res) => {
+  try {
+    const { flag } = req.body
+    const client = sessions.get(req.params.sessionId)
+    await client.setAutoDownloadVideos(flag)
+    res.json({ success: true })
+  } catch (error) {
+    sendErrorResponse(res, 500, error.message)
+  }
+}
+
+const setBackgroundSync = async (req, res) => {
+  try {
+    const { flag } = req.body
+    const client = sessions.get(req.params.sessionId)
+    const result = await client.setBackgroundSync(flag)
+    res.json({ success: true, result })
+  } catch (error) {
+    sendErrorResponse(res, 500, error.message)
+  }
+}
+
+const getContactDeviceCount = async (req, res) => {
+  try {
+    const { userId } = req.body
+    const client = sessions.get(req.params.sessionId)
+    const result = await client.getContactDeviceCount(userId)
+    res.json({ success: true, result })
+  } catch (error) {
+    sendErrorResponse(res, 500, error.message)
+  }
+}
+
+const syncHistory = async (req, res) => {
+  try {
+    const { chatId } = req.body
+    const client = sessions.get(req.params.sessionId)
+    const result = await client.syncHistory(chatId)
+    res.json({ success: true, result })
+  } catch (error) {
+    sendErrorResponse(res, 500, error.message)
+  }
+}
+
+const createCallLink = async (req, res) => {
+  try {
+    const { startTime, callType } = req.body
+    const client = sessions.get(req.params.sessionId)
+    const result = await client.createCallLink(startTime, callType)
+    res.json({ success: true, result })
+  } catch (error) {
+    sendErrorResponse(res, 500, error.message)
+  }
+}
+
+const sendResponseToScheduledEvent = async (req, res) => {
+  try {
+    const { response, eventMessageId } = req.body
+    const client = sessions.get(req.params.sessionId)
+    const result = await client.sendResponseToScheduledEvent(response, eventMessageId)
+    res.json({ success: true, result })
+  } catch (error) {
+    sendErrorResponse(res, 500, error.message)
+  }
+}
+
+const saveOrEditAddressbookContact = async (req, res) => {
+  try {
+    const { phoneNumber, firstName, lastName, syncToAddressbook } = req.body
+    const client = sessions.get(req.params.sessionId)
+    const result = await client.saveOrEditAddressbookContact(phoneNumber, firstName, lastName, syncToAddressbook)
+    res.json({ success: true, result })
+  } catch (error) {
+    sendErrorResponse(res, 500, error.message)
+  }
+}
+
+const deleteAddressbookContact = async (req, res) => {
+  try {
+    const { phoneNumber } = req.body
+    const client = sessions.get(req.params.sessionId)
+    const result = await client.deleteAddressbookContact(phoneNumber)
+    res.json({ success: true, result })
+  } catch (error) {
+    sendErrorResponse(res, 500, error.message)
+  }
+}
+
+const addOrEditCustomerNote = async (req, res) => {
+  try {
+    const { userId, note } = req.body
+    const client = sessions.get(req.params.sessionId)
+    const result = await client.addOrEditCustomerNote(userId, note)
+    res.json({ success: true, result })
+  } catch (error) {
+    sendErrorResponse(res, 500, error.message)
+  }
+}
+
+const getCustomerNote = async (req, res) => {
+  try {
+    const { userId } = req.body
+    const client = sessions.get(req.params.sessionId)
+    const result = await client.getCustomerNote(userId)
+    res.json({ success: true, result })
+  } catch (error) {
+    sendErrorResponse(res, 500, error.message)
+  }
+}
+
+const getPollVotes = async (req, res) => {
+  try {
+    const { messageId } = req.body
+    const client = sessions.get(req.params.sessionId)
+    const result = await client.getPollVotes(messageId)
+    res.json({ success: true, result })
+  } catch (error) {
+    sendErrorResponse(res, 500, error.message)
+  }
+}
+
+const deleteProfilePicture = async (req, res) => {
+  try {
+    const client = sessions.get(req.params.sessionId)
+    const result = await client.deleteProfilePicture()
+    res.json({ success: true, result })
+  } catch (error) {
+    sendErrorResponse(res, 500, error.message)
+  }
+}
+
+const createChannel = async (req, res) => {
+  try {
+    const { title, options } = req.body
+    const client = sessions.get(req.params.sessionId)
+    const result = await client.createChannel(title, options)
+    res.json({ success: true, result })
+  } catch (error) {
+    sendErrorResponse(res, 500, error.message)
+  }
+}
+
+const subscribeToChannel = async (req, res) => {
+  try {
+    const { channelId } = req.body
+    const client = sessions.get(req.params.sessionId)
+    const result = await client.subscribeToChannel(channelId)
+    res.json({ success: true, result })
+  } catch (error) {
+    sendErrorResponse(res, 500, error.message)
+  }
+}
+
+const unsubscribeFromChannel = async (req, res) => {
+  try {
+    const { channelId, options } = req.body
+    const client = sessions.get(req.params.sessionId)
+    const result = await client.unsubscribeFromChannel(channelId, options)
+    res.json({ success: true, result })
+  } catch (error) {
+    sendErrorResponse(res, 500, error.message)
+  }
+}
+
+const transferChannelOwnership = async (req, res) => {
+  try {
+    const { channelId, newOwnerId, options } = req.body
+    const client = sessions.get(req.params.sessionId)
+    const result = await client.transferChannelOwnership(channelId, newOwnerId, options)
+    res.json({ success: true, result })
+  } catch (error) {
+    sendErrorResponse(res, 500, error.message)
+  }
+}
+
+const searchChannels = async (req, res) => {
+  try {
+    const { searchOptions } = req.body
+    const client = sessions.get(req.params.sessionId)
+    const result = await client.searchChannels(searchOptions)
+    res.json({ success: true, result })
+  } catch (error) {
+    sendErrorResponse(res, 500, error.message)
+  }
+}
+
+const deleteChannel = async (req, res) => {
+  try {
+    const { channelId } = req.body
+    const client = sessions.get(req.params.sessionId)
+    const result = await client.deleteChannel(channelId)
+    res.json({ success: true, result })
+  } catch (error) {
+    sendErrorResponse(res, 500, error.message)
+  }
+}
+
+const setDeviceName = async (req, res) => {
+  try {
+    const { deviceName, browserName } = req.body
+    const client = sessions.get(req.params.sessionId)
+    await client.setDeviceName(deviceName, browserName)
+    res.json({ success: true })
+  } catch (error) {
+    sendErrorResponse(res, 500, error.message)
+  }
+}
+
+const resetState = async (req, res) => {
+  try {
+    const client = sessions.get(req.params.sessionId)
+    await client.resetState()
+    res.json({ success: true })
+  } catch (error) {
+    sendErrorResponse(res, 500, error.message)
+  }
+}
+
 module.exports = {
+
   getClassInfo,
   acceptInvite,
   archiveChat,
@@ -1311,4 +1959,52 @@ module.exports = {
   unmuteChat,
   unpinChat,
   getWWebVersion
+,
+  getContactLidAndPhone,
+  sendReaction,
+  requestPairingCode,
+  cancelPairingCode,
+  getChannels,
+  getChannelByInviteCode,
+  sendChannelAdminInvite,
+  acceptChannelAdminInvite,
+  revokeChannelAdminInvite,
+  demoteChannelAdmin,
+  getMessageById,
+  getPinnedMessages,
+  acceptGroupV4Invite,
+  getFormattedNumber,
+  getCountryCode,
+  getBroadcasts,
+  getBroadcastById,
+  revokeStatusMessage,
+  getGroupMembershipRequests,
+  approveGroupMembershipRequests,
+  rejectGroupMembershipRequests,
+  setAutoDownloadAudio,
+  setAutoDownloadDocuments,
+  setAutoDownloadPhotos,
+  setAutoDownloadVideos,
+  setBackgroundSync,
+  getContactDeviceCount,
+  syncHistory,
+  createCallLink,
+  sendResponseToScheduledEvent,
+  saveOrEditAddressbookContact,
+  deleteAddressbookContact,
+  addOrEditCustomerNote,
+  getCustomerNote,
+  getPollVotes,
+  deleteProfilePicture,
+  createChannel,
+  subscribeToChannel,
+  unsubscribeFromChannel,
+  transferChannelOwnership,
+  searchChannels,
+  deleteChannel,
+  setDeviceName,
+  resetState,
+  debugContactNames,
+  getMessageReactions,
+  sendReactionDirect
 }

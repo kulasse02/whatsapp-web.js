@@ -6,7 +6,8 @@ const endpointsFiles = ['./src/routes.js']
 const doc = {
   info: {
     title: 'WhatsApp API',
-    description: 'API Wrapper for WhatsAppWebJS'
+    description: 'API Wrapper for WhatsAppWebJS',
+    version: '1.0.3'
   },
   servers: [
     {
@@ -38,6 +39,18 @@ const doc = {
     {
       name: 'Message',
       description: 'May fail if the message is too old (Only from the last 100 Messages of the given chat)'
+    },
+    {
+      name: 'Contact',
+      description: 'Handling contacts'
+    },
+    {
+      name: 'Chat',
+      description: 'Handling chats'
+    },
+    {
+      name: 'Group Chat',
+      description: 'Handling group chats'
     }
   ],
   definitions: {

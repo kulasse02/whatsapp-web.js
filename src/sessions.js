@@ -1,27 +1,128 @@
 const { Client, LocalAuth } = require('whatsapp-web.js')
 const fs = require('fs')
 const path = require('path')
-const sessions = new Map()
-const { baseWebhookURL, sessionFolderPath, maxAttachmentSize, setMessagesAsSeen, webVersion, webVersionCacheType, recoverSessions } = require('./config')
+const { baseWebhookURL, sessionFolderPath, maxAttachmentSize, setMessagesAsSeen, webVersion, webVersionCacheType, recoverSessions, maxActiveSessions, sessionIdleTimeoutMs } = require('./config')
+const db = require('./database')
 const { triggerWebhook, waitForNestedObject, checkIfEventisEnabled } = require('./utils')
+
+const sessions = new Map()
+const sessionReactions = new Map()
+const sessionActivity = new Map()
+
+const touchSession = (sessionId) => {
+  sessionActivity.set(sessionId, Date.now())
+}
+
+const saveMessage = async (sessionId, message) => {
+  try {
+    const remoteJid = message._data?.id?.remote || message._data?.remoteJid || (message.fromMe ? message.to : message.from)
+    if (!remoteJid) { console.log('saveMessage: no remoteJid', message.fromMe, message.from, message.to); return }
+    const msgWid = message.id?.id || null
+
+    // Check for duplicate msg_wid within the session to prevent double-inserting
+    if (msgWid) {
+      const existing = db.prepare('SELECT id FROM messages WHERE session_id = ? AND msg_wid = ? LIMIT 1').get(sessionId, msgWid)
+      if (existing) return
+    }
+
+    let mimetype = message.mimetype || message._data?.mimetype || null
+    let mediaPath = null
+    if (message.hasMedia && maxAttachmentSize > 0) {
+      try {
+        const media = await message.downloadMedia().catch(() => null)
+        if (media && media.data) {
+          if (!mimetype) mimetype = media.mimetype
+          const rawMime = (typeof mimetype === 'string' && mimetype) ? mimetype : 'application/octet-stream'
+          const ext = (rawMime.split('/')[1] || 'bin').split(';')[0] || 'bin'
+          const dir = path.join(__dirname, '..', 'data', 'media', sessionId)
+          fs.mkdirSync(dir, { recursive: true })
+          const filename = `${remoteJid}_${message.timestamp || Date.now()}.${ext}`
+          const filepath = path.join(dir, filename)
+          fs.writeFileSync(filepath, media.data, 'base64')
+          mediaPath = `/media/${sessionId}/${filename}`
+        }
+      } catch (err) {
+        console.error(`Session ${sessionId} saveMessage media download error:`, err.message)
+      }
+    }
+    
+    // Extract quote/reply references (WhatsApp Web structure)
+    let parentMsgId = null
+    let parentMsgBody = null
+    if (message.hasQuotedMsg || message._data?.quotedStanzaID || message._data?.quotedMsg) {
+      parentMsgId = message._data?.quotedStanzaID || message._data?.quotedMsg?.id?.id || message._data?.quotedMsg?.id?._serialized || null
+      parentMsgBody = message._data?.quotedMsg?.body || message._data?.quotedMsg?.caption || null
+      
+      if (!parentMsgBody && typeof message.getQuotedMessage === 'function') {
+        try {
+          const quotedMsgObj = await message.getQuotedMessage()
+          if (quotedMsgObj) {
+            parentMsgId = parentMsgId || quotedMsgObj.id?.id || quotedMsgObj.id?._serialized || null
+            parentMsgBody = quotedMsgObj.body || quotedMsgObj.caption || null
+          }
+        } catch (e) {}
+      }
+    }
+
+    const stmt = db.prepare('INSERT INTO messages (session_id, from_me, remote_jid, body, message_type, mimetype, media_path, msg_wid, timestamp, parent_msg_id, parent_msg_body) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    stmt.run(sessionId, message.fromMe ? 1 : 0, remoteJid, message.body || '', message.type || 'chat', mimetype, mediaPath, msgWid, message.timestamp || Math.floor(Date.now() / 1000), parentMsgId, parentMsgBody)
+  } catch (e) { console.log('saveMessage error:', e.message) }
+}
+
+const destroyAllBrowsers = async () => {
+  for (const [id, client] of sessions) {
+    console.log(`Destroying browser for session ${id}`)
+    try {
+      if (client._idleTimer) clearTimeout(client._idleTimer)
+      if (client.pupBrowser) {
+        const childProcess = client.pupBrowser.process()
+        if (childProcess) childProcess.kill('SIGKILL')
+        await client.pupBrowser.close().catch(() => {})
+      }
+      await client.destroy().catch(() => {})
+    } catch (e) { /* ignore */ }
+  }
+  sessions.clear()
+  sessionActivity.clear()
+}
+
+process.on('SIGTERM', async () => { await destroyAllBrowsers(); process.exit(0) })
+process.on('SIGINT', async () => { await destroyAllBrowsers(); process.exit(0) })
+process.on('exit', () => {
+  for (const [, client] of sessions) {
+    const proc = client.pupBrowser?.process()
+    if (proc) proc.kill('SIGKILL')
+  }
+})
+
+const removeSingletonFiles = (sessionDir) => {
+  for (const file of ['SingletonLock', 'SingletonCookie', 'SingletonSocket']) {
+    try {
+      const fp = path.join(sessionDir, file)
+      if (fs.existsSync(fp)) fs.unlinkSync(fp)
+    } catch (e) { /* ignore */ }
+  }
+}
 
 // Function to validate if the session is ready
 const validateSession = async (sessionId) => {
   try {
     const returnData = { success: false, state: null, message: '' }
 
-    // Session not Connected 😢
     if (!sessions.has(sessionId) || !sessions.get(sessionId)) {
       returnData.message = 'session_not_found'
       return returnData
     }
 
     const client = sessions.get(sessionId)
-    // wait until the client is created
-    await waitForNestedObject(client, 'pupPage')
-      .catch((err) => { return { success: false, state: null, message: err.message } })
+    const hasPage = await waitForNestedObject(client, 'pupPage', 3000)
+      .then(() => true)
+      .catch(() => false)
 
-    // Wait for client.pupPage to be evaluable
+    if (!hasPage) {
+      return { success: false, state: null, message: 'session_not_ready' }
+    }
+
     let maxRetry = 0
     while (true) {
       try {
@@ -48,7 +149,6 @@ const validateSession = async (sessionId) => {
       return returnData
     }
 
-    // Session Connected 🎉
     returnData.success = true
     returnData.message = 'session_connected'
     return returnData
@@ -58,39 +158,60 @@ const validateSession = async (sessionId) => {
   }
 }
 
-// Function to handle client session restoration
-const restoreSessions = () => {
+// Function to handle client session restoration (sequential to avoid race conditions)
+const restoreSessions = async () => {
   try {
     if (!fs.existsSync(sessionFolderPath)) {
-      fs.mkdirSync(sessionFolderPath) // Create the session directory if it doesn't exist
+      fs.mkdirSync(sessionFolderPath)
+      return
     }
-    // Read the contents of the folder
-    fs.readdir(sessionFolderPath, (_, files) => {
-      // Iterate through the files in the parent folder
-      for (const file of files) {
-        // Use regular expression to extract the string from the folder name
-        const match = file.match(/^session-(.+)$/)
-        if (match) {
-          const sessionId = match[1]
-          console.log('existing session detected', sessionId)
-          setupSession(sessionId)
-        }
+    const files = await fs.promises.readdir(sessionFolderPath)
+    const sessionDirs = files.filter(f => /^session-.+$/.test(f))
+    for (const file of sessionDirs) {
+      const match = file.match(/^session-(.+)$/)
+      if (match) {
+        const sessionId = match[1]
+        const sessionDir = path.join(sessionFolderPath, file)
+        removeSingletonFiles(sessionDir)
+        console.log('existing session detected', sessionId)
+        // Ensure restored sessions exist in DB table so they remain visible to admin / owner
+        try {
+          const db = require('./database')
+          const existing = db.prepare('SELECT id FROM user_sessions WHERE session_id = ?').get(sessionId)
+          if (!existing) {
+            // Register under default admin user (id: 1)
+            const adminUser = db.prepare('SELECT id FROM users WHERE is_admin = 1 LIMIT 1').get()
+            const adminId = adminUser ? adminUser.id : 1
+            db.prepare('INSERT INTO user_sessions (user_id, session_id) VALUES (?, ?)').run(adminId, sessionId)
+          }
+        } catch (_) {}
+        await setupSession(sessionId)
       }
-    })
+    }
   } catch (error) {
-    console.log(error)
     console.error('Failed to restore sessions:', error)
   }
 }
 
-// Setup Session
-const setupSession = (sessionId) => {
+const setupSession = async (sessionId) => {
   try {
     if (sessions.has(sessionId)) {
       return { success: false, message: `Session already exists for: ${sessionId}`, client: sessions.get(sessionId) }
     }
 
-    // Disable the delete folder from the logout function (will be handled separately)
+    if (sessions.size >= maxActiveSessions) {
+      return {
+        success: false,
+        message: `Max active sessions limit (${maxActiveSessions}) reached. Terminate an inactive session first.`,
+        client: null
+      }
+    }
+
+    const sessionDir = path.join(sessionFolderPath, `session-${sessionId}`)
+    if (fs.existsSync(sessionDir)) {
+      removeSingletonFiles(sessionDir)
+    }
+
     const localAuth = new LocalAuth({ clientId: sessionId, dataPath: sessionFolderPath })
     delete localAuth.logout
     localAuth.logout = () => { }
@@ -101,7 +222,7 @@ const setupSession = (sessionId) => {
         // headless: false,
         args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-gpu', '--disable-dev-shm-usage']
       },
-      userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36',
+      userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36',
       authStrategy: localAuth
     }
 
@@ -134,6 +255,22 @@ const setupSession = (sessionId) => {
 
     // Save the session to the Map
     sessions.set(sessionId, client)
+    touchSession(sessionId)
+
+    // Idle timeout: if configured (>0) and no activity for sessionIdleTimeoutMs, close the browser and drop the session
+    if (client._idleTimer) clearTimeout(client._idleTimer)
+    if (sessionIdleTimeoutMs > 0) {
+      client._idleTimer = setTimeout(async () => {
+        if (sessions.get(sessionId) !== client) return
+        const last = sessionActivity.get(sessionId) || 0
+        if (Date.now() - last >= sessionIdleTimeoutMs) {
+          console.log(`Session ${sessionId} idle for >${sessionIdleTimeoutMs}ms. Closing browser.`)
+          await disconnectSession(sessionId)
+        }
+      }, sessionIdleTimeoutMs)
+      if (client._idleTimer && typeof client._idleTimer.unref === 'function') client._idleTimer.unref()
+    }
+
     return { success: true, message: 'Session initiated successfully', client }
   } catch (error) {
     return { success: false, message: error.message, client: null }
@@ -144,12 +281,23 @@ const initializeEvents = (client, sessionId) => {
   // check if the session webhook is overridden
   const sessionWebhook = process.env[sessionId.toUpperCase() + '_WEBHOOK_URL'] || baseWebhookURL
 
+  client.on('ready', () => {
+    console.log(`Session ${sessionId} ready`)
+    client.qr = null
+    touchSession(sessionId)
+  })
+
+  client.on('authenticated', () => {
+    console.log(`Session ${sessionId} authenticated`)
+    client.qr = null
+  })
+
   if (recoverSessions) {
     waitForNestedObject(client, 'pupPage').then(() => {
       const restartSession = async (sessionId) => {
         sessions.delete(sessionId)
         await client.destroy().catch(e => { })
-        setupSession(sessionId)
+        await setupSession(sessionId)
       }
       client.pupPage.once('close', function () {
         // emitted when the page closes
@@ -234,23 +382,40 @@ const initializeEvents = (client, sessionId) => {
       })
     })
 
+  const { processAutoReply } = require('./services/autoReplyService')
+
   checkIfEventisEnabled('message')
     .then(_ => {
       client.on('message', async (message) => {
         triggerWebhook(sessionWebhook, sessionId, 'message', { message })
-        if (message.hasMedia && message._data?.size < maxAttachmentSize) {
-          // custom service event
+        touchSession(sessionId)
+        
+        // Trigger Workflow Auto Reply Engine
+        processAutoReply(client, sessionId, message).catch(e => console.log('AutoReply execution error:', e.message))
+
+        if (message.hasMedia && typeof message._data?.size === 'number' && message._data.size < maxAttachmentSize) {
           checkIfEventisEnabled('media').then(_ => {
-            message.downloadMedia().then(messageMedia => {
-              triggerWebhook(sessionWebhook, sessionId, 'media', { messageMedia, message })
-            }).catch(e => {
-              console.log('Download media error:', e.message)
-            })
+            const hasValidMime = !!(message.mimetype || message._data?.mimetype)
+            if (hasValidMime) {
+              message.downloadMedia().then(messageMedia => {
+                if (messageMedia) {
+                  triggerWebhook(sessionWebhook, sessionId, 'media', { messageMedia, message })
+                }
+              }).catch(e => {
+                // Non-fatal download error (e.g. expired media or network issue)
+              })
+            }
           })
         }
-        if (setMessagesAsSeen) {
-          const chat = await message.getChat()
-          chat.sendSeen()
+        if (setMessagesAsSeen && message.from && !message.from.includes('status@broadcast') && !message.from.includes('newsletter')) {
+          try {
+            const chat = await message.getChat().catch(() => null)
+            if (chat && typeof chat.sendSeen === 'function') {
+              chat.sendSeen().catch(() => {})
+            }
+          } catch (e) {
+            // ignore non-fatal getChat error
+          }
         }
       })
     })
@@ -259,9 +424,16 @@ const initializeEvents = (client, sessionId) => {
     .then(_ => {
       client.on('message_ack', async (message, ack) => {
         triggerWebhook(sessionWebhook, sessionId, 'message_ack', { message, ack })
-        if (setMessagesAsSeen) {
-          const chat = await message.getChat()
-          chat.sendSeen()
+        touchSession(sessionId)
+        if (setMessagesAsSeen && message.from && !message.from.includes('status@broadcast') && !message.from.includes('newsletter')) {
+          try {
+            const chat = await message.getChat().catch(() => null)
+            if (chat && typeof chat.sendSeen === 'function') {
+              chat.sendSeen().catch(() => {})
+            }
+          } catch (e) {
+            // ignore non-fatal getChat error
+          }
         }
       })
     })
@@ -270,9 +442,17 @@ const initializeEvents = (client, sessionId) => {
     .then(_ => {
       client.on('message_create', async (message) => {
         triggerWebhook(sessionWebhook, sessionId, 'message_create', { message })
-        if (setMessagesAsSeen) {
-          const chat = await message.getChat()
-          chat.sendSeen()
+        touchSession(sessionId)
+        saveMessage(sessionId, message)
+        if (setMessagesAsSeen && message.from && !message.from.includes('status@broadcast') && !message.from.includes('newsletter')) {
+          try {
+            const chat = await message.getChat().catch(() => null)
+            if (chat && typeof chat.sendSeen === 'function') {
+              chat.sendSeen().catch(() => {})
+            }
+          } catch (e) {
+            // ignore non-fatal getChat error
+          }
         }
       })
     })
@@ -281,6 +461,20 @@ const initializeEvents = (client, sessionId) => {
     .then(_ => {
       client.on('message_reaction', (reaction) => {
         triggerWebhook(sessionWebhook, sessionId, 'message_reaction', { reaction })
+        const msgId = reaction.msgId?._serialized || reaction.msgId?.id
+        if (msgId) {
+          if (!sessionReactions.has(sessionId)) sessionReactions.set(sessionId, new Map())
+          const map = sessionReactions.get(sessionId)
+          if (!map.has(msgId)) map.set(msgId, [])
+          const existing = map.get(msgId)
+          const idx = existing.findIndex(r => r.senderId === reaction.senderId)
+          if (idx >= 0) {
+            if (reaction.reaction) existing[idx].emoji = reaction.reaction
+            else existing.splice(idx, 1)
+          } else if (reaction.reaction) {
+            existing.push({ emoji: reaction.reaction, senderId: reaction.senderId, ts: reaction.timestamp })
+          }
+        }
       })
     })
 
@@ -380,30 +574,27 @@ const deleteSessionFolder = async (sessionId) => {
   }
 }
 
-// Function to reload client session without removing browser cache
 const reloadSession = async (sessionId) => {
   try {
     const client = sessions.get(sessionId)
-    if (!client) {
-      return
-    }
-    client.pupPage.removeAllListeners('close')
-    client.pupPage.removeAllListeners('error')
-    try {
-      const pages = await client.pupBrowser.pages()
-      await Promise.all(pages.map((page) => page.close()))
-      await Promise.race([
-        client.pupBrowser.close(),
-        new Promise(resolve => setTimeout(resolve, 5000))
-      ])
-    } catch (e) {
+    if (!client) return
+    client.pupPage?.removeAllListeners('close')
+    client.pupPage?.removeAllListeners('error')
+    if (client.pupBrowser) {
       const childProcess = client.pupBrowser.process()
-      if (childProcess) {
-        childProcess.kill(9)
-      }
+      try {
+        const pages = await client.pupBrowser.pages().catch(() => [])
+        await Promise.allSettled(pages.map((page) => page.close().catch(() => {})))
+        await Promise.race([
+          client.pupBrowser.close().catch(() => {}),
+          new Promise(resolve => setTimeout(resolve, 3000))
+        ])
+      } catch (e) { /* ignore */ }
+      if (childProcess) childProcess.kill('SIGKILL')
     }
     sessions.delete(sessionId)
-    setupSession(sessionId)
+    sessionActivity.delete(sessionId)
+    await setupSession(sessionId)
   } catch (error) {
     console.log(error)
     throw error
@@ -413,30 +604,29 @@ const reloadSession = async (sessionId) => {
 const deleteSession = async (sessionId, validation) => {
   try {
     const client = sessions.get(sessionId)
-    if (!client) {
-      return
+    if (client) {
+      client.pupPage?.removeAllListeners('close')
+      client.pupPage?.removeAllListeners('error')
+      const childProcess = client.pupBrowser?.process()
+      if (validation?.success) {
+        console.log(`Logging out session ${sessionId}`)
+        await client.logout().catch(() => {})
+      } else if (validation?.message === 'session_not_connected') {
+        console.log(`Destroying session ${sessionId}`)
+        await client.destroy().catch(() => {})
+      }
+      if (childProcess) childProcess.kill('SIGKILL')
+      sessions.delete(sessionId)
+      sessionActivity.delete(sessionId)
     }
-    client.pupPage.removeAllListeners('close')
-    client.pupPage.removeAllListeners('error')
-    if (validation.success) {
-      // Client Connected, request logout
-      console.log(`Logging out session ${sessionId}`)
-      await client.logout()
-    } else if (validation.message === 'session_not_connected') {
-      // Client not Connected, request destroy
-      console.log(`Destroying session ${sessionId}`)
-      await client.destroy()
-    }
-    // Wait 10 secs for client.pupBrowser to be disconnected before deleting the folder
-    let maxDelay = 0
-    while (client.pupBrowser.isConnected() && (maxDelay < 10)) {
-      await new Promise(resolve => setTimeout(resolve, 1000))
-      maxDelay++
-    }
-    await deleteSessionFolder(sessionId)
-    sessions.delete(sessionId)
+
+    // Always delete folder and DB record regardless of in-memory status
+    await deleteSessionFolder(sessionId).catch(() => {})
+    try {
+      db.prepare('DELETE FROM user_sessions WHERE session_id = ?').run(sessionId)
+    } catch (_) {}
   } catch (error) {
-    console.log(error)
+    console.log('deleteSession error:', error)
     throw error
   }
 }
@@ -464,12 +654,99 @@ const flushSessions = async (deleteOnlyInactive) => {
   }
 }
 
+const disconnectSession = async (sessionId) => {
+  try {
+    const client = sessions.get(sessionId)
+    if (!client) return
+    client.pupPage?.removeAllListeners('close')
+    client.pupPage?.removeAllListeners('error')
+    if (client.pupBrowser) {
+      const childProcess = client.pupBrowser.process()
+      try {
+        const pages = await client.pupBrowser.pages().catch(() => [])
+        await Promise.allSettled(pages.map((page) => page.close().catch(() => {})))
+        await Promise.race([
+          client.pupBrowser.close().catch(() => {}),
+          new Promise(resolve => setTimeout(resolve, 3000))
+        ])
+      } catch (e) { /* ignore */ }
+      if (childProcess) childProcess.kill('SIGKILL')
+    }
+    if (client._idleTimer) clearTimeout(client._idleTimer)
+    sessions.delete(sessionId)
+    sessionActivity.delete(sessionId)
+  } catch (error) {
+    console.log(error)
+    throw error
+  }
+}
+
+const periodicSessionCleaner = async () => {
+  const now = Date.now()
+  const reaped = []
+  for (const [sessionId, client] of sessions) {
+    try {
+      // Browser already dead (tab closed / crashed) -> zombie session
+      let browserDead = false
+      if (client.pupPage && typeof client.pupPage.isClosed === 'function') {
+        try {
+          browserDead = client.pupPage.isClosed()
+        } catch (_) {
+          browserDead = true
+        }
+      }
+      if (!client.pupBrowser) browserDead = true
+
+      const last = sessionActivity.get(sessionId) || 0
+      const isIdle = sessionIdleTimeoutMs > 0 && (now - last >= sessionIdleTimeoutMs)
+      
+      // Never kill a connected healthy session just because of inactivity unless browser is dead
+      let shouldReap = browserDead
+      if (!browserDead && isIdle) {
+        // If state is CONNECTED, keep it alive unless forced
+        const state = await client.getState().catch(() => null)
+        if (state !== 'CONNECTED') {
+          shouldReap = true
+        } else {
+          // If still connected, refresh activity so it's not marked idle continuously
+          touchSession(sessionId)
+        }
+      }
+
+      if (shouldReap) {
+        console.log(`Cleaner: closing session ${sessionId} (deadBrowser=${browserDead}, idle=${isIdle})`)
+        await disconnectSession(sessionId)
+        reaped.push(sessionId)
+      }
+    } catch (e) {
+      console.log(`Cleaner error for ${sessionId}:`, e.message)
+    }
+  }
+  if (reaped.length) {
+    console.log(`Cleaner: ${reaped.length} session(s) closed: ${reaped.join(', ')}`)
+  }
+}
+
+const startPeriodicCleaner = (intervalMs) => {
+  const timer = setInterval(() => {
+    periodicSessionCleaner().catch(e => console.error('periodicSessionCleaner error:', e.message))
+  }, intervalMs)
+  if (timer && typeof timer.unref === 'function') timer.unref()
+  return timer
+}
+
 module.exports = {
   sessions,
+  sessionReactions,
   setupSession,
   restoreSessions,
   validateSession,
   deleteSession,
   reloadSession,
-  flushSessions
+  flushSessions,
+  disconnectSession,
+  periodicSessionCleaner,
+  startPeriodicCleaner,
+  touchSession,
+  saveMessage
 }

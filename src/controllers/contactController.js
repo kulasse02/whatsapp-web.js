@@ -206,6 +206,56 @@ const unblock = async (req, res) => {
   }
 }
 
+/**
+ * Retrieves the common groups with a given contactId.
+ *
+ * @async
+ * @function getCommonGroups
+ * @param {Object} req - The request object.
+ * @param {Object} res - The response object.
+ * @param {string} req.params.sessionId - The session ID.
+ * @param {string} req.body.contactId - The ID of the contact.
+ * @throws {Error} If the contact is not found.
+ * @returns {Promise<void>} A promise that resolves with the common groups.
+ */
+const getCommonGroups = async (req, res) => {
+  try {
+    const { contactId } = req.body
+    const client = sessions.get(req.params.sessionId)
+    const contact = await client.getContactById(contactId)
+    if (!contact) { sendErrorResponse(res, 404, 'Contact not Found') }
+    const result = await contact.getCommonGroups()
+    res.json({ success: true, result })
+  } catch (error) {
+    sendErrorResponse(res, 500, error.message)
+  }
+}
+
+/**
+ * Retrieves the broadcast for a given contactId.
+ *
+ * @async
+ * @function getBroadcast
+ * @param {Object} req - The request object.
+ * @param {Object} res - The response object.
+ * @param {string} req.params.sessionId - The session ID.
+ * @param {string} req.body.contactId - The ID of the contact.
+ * @throws {Error} If the contact is not found.
+ * @returns {Promise<void>} A promise that resolves with the broadcast info.
+ */
+const getBroadcast = async (req, res) => {
+  try {
+    const { contactId } = req.body
+    const client = sessions.get(req.params.sessionId)
+    const contact = await client.getContactById(contactId)
+    if (!contact) { sendErrorResponse(res, 404, 'Contact not Found') }
+    const result = await contact.getBroadcast()
+    res.json({ success: true, result })
+  } catch (error) {
+    sendErrorResponse(res, 500, error.message)
+  }
+}
+
 module.exports = {
   getClassInfo,
   block,
@@ -214,5 +264,7 @@ module.exports = {
   unblock,
   getFormattedNumber,
   getCountryCode,
-  getProfilePicUrl
+  getProfilePicUrl,
+  getCommonGroups,
+  getBroadcast
 }

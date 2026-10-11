@@ -1,4 +1,4 @@
-const { sessions } = require('../sessions')
+const { sessions, saveMessage } = require('../sessions')
 const { sendErrorResponse } = require('../utils')
 
 /**
@@ -14,7 +14,11 @@ const { sendErrorResponse } = require('../utils')
 const _getMessageById = async (client, messageId, chatId) => {
   const chat = await client.getChatById(chatId)
   const messages = await chat.fetchMessages({ limit: 100 })
-  const message = messages.find((message) => { return message.id.id === messageId })
+  // Extract short hash from full serialized ID (e.g. "false_123@lid_ABCDEF" -> "ABCDEF")
+  const shortId = messageId.includes('_') ? messageId.split('_').pop() : messageId
+  const message = messages.find((m) => {
+    return m.id.id === messageId || m.id._serialized === messageId || m.id.id === shortId
+  })
   return message
 }
 
@@ -297,12 +301,16 @@ const react = async (req, res) => {
  */
 const reply = async (req, res) => {
   try {
-    const { messageId, chatId, content, destinationChatId, options } = req.body
+    const { messageId, chatId, content } = req.body
     const client = sessions.get(req.params.sessionId)
-    const message = await _getMessageById(client, messageId, chatId)
-    if (!message) { throw new Error('Message not Found') }
-    const repliedMessage = await message.reply(content, destinationChatId, options)
-    res.json({ success: true, repliedMessage })
+    
+    // Use client.sendMessage with quotedMessageId - the library's internal Utils.js
+    // handles finding the quoted message in browser context via Msg.get() / getMessagesById()
+    const sentMsg = await client.sendMessage(chatId, content, { quotedMessageId: messageId })
+    if (sentMsg) {
+      saveMessage(req.params.sessionId, sentMsg).catch(() => {})
+    }
+    res.json({ success: true, repliedMessage: sentMsg })
   } catch (error) {
     sendErrorResponse(res, 500, error.message)
   }
@@ -358,6 +366,132 @@ const unstar = async (req, res) => {
   }
 }
 
+/**
+ * Pins a message.
+ * @async
+ * @function pinMessage
+ */
+const pinMessage = async (req, res) => {
+  try {
+    const { messageId, chatId, duration } = req.body
+    const client = sessions.get(req.params.sessionId)
+    const message = await _getMessageById(client, messageId, chatId)
+    if (!message) { throw new Error('Message not Found') }
+    const result = await message.pin(duration)
+    res.json({ success: true, result })
+  } catch (error) {
+    sendErrorResponse(res, 500, error.message)
+  }
+}
+
+/**
+ * Unpins a message.
+ * @async
+ * @function unpinMessage
+ */
+const unpinMessage = async (req, res) => {
+  try {
+    const { messageId, chatId } = req.body
+    const client = sessions.get(req.params.sessionId)
+    const message = await _getMessageById(client, messageId, chatId)
+    if (!message) { throw new Error('Message not Found') }
+    const result = await message.unpin()
+    res.json({ success: true, result })
+  } catch (error) {
+    sendErrorResponse(res, 500, error.message)
+  }
+}
+
+/**
+ * Gets reactions on a message.
+ * @async
+ * @function getReactions
+ */
+const getReactions = async (req, res) => {
+  try {
+    const { messageId, chatId } = req.body
+    const client = sessions.get(req.params.sessionId)
+    const message = await _getMessageById(client, messageId, chatId)
+    if (!message) { throw new Error('Message not Found') }
+    const result = await message.getReactions()
+    res.json({ success: true, result })
+  } catch (error) {
+    sendErrorResponse(res, 500, error.message)
+  }
+}
+
+/**
+ * Edits a message.
+ * @async
+ * @function editMessage
+ */
+const editMessage = async (req, res) => {
+  try {
+    const { messageId, chatId, content, options } = req.body
+    const client = sessions.get(req.params.sessionId)
+    const message = await _getMessageById(client, messageId, chatId)
+    if (!message) { throw new Error('Message not Found') }
+    const result = await message.edit(content, options)
+    res.json({ success: true, result })
+  } catch (error) {
+    sendErrorResponse(res, 500, error.message)
+  }
+}
+
+/**
+ * Gets group mentions in a message.
+ * @async
+ * @function getGroupMentions
+ */
+const getGroupMentions = async (req, res) => {
+  try {
+    const { messageId, chatId } = req.body
+    const client = sessions.get(req.params.sessionId)
+    const message = await _getMessageById(client, messageId, chatId)
+    if (!message) { throw new Error('Message not Found') }
+    const result = await message.getGroupMentions()
+    res.json({ success: true, result })
+  } catch (error) {
+    sendErrorResponse(res, 500, error.message)
+  }
+}
+
+/**
+ * Gets poll votes in a message.
+ * @async
+ * @function getPollVotes
+ */
+const getPollVotes = async (req, res) => {
+  try {
+    const { messageId, chatId } = req.body
+    const client = sessions.get(req.params.sessionId)
+    const message = await _getMessageById(client, messageId, chatId)
+    if (!message) { throw new Error('Message not Found') }
+    const result = await message.getPollVotes()
+    res.json({ success: true, result })
+  } catch (error) {
+    sendErrorResponse(res, 500, error.message)
+  }
+}
+
+/**
+ * Votes on a poll.
+ * @async
+ * @function vote
+ */
+const vote = async (req, res) => {
+  try {
+    const { messageId, chatId, selectedOptions } = req.body
+    const client = sessions.get(req.params.sessionId)
+    const message = await _getMessageById(client, messageId, chatId)
+    if (!message) { throw new Error('Message not Found') }
+    const result = await message.vote(selectedOptions)
+    res.json({ success: true, result })
+  } catch (error) {
+    sendErrorResponse(res, 500, error.message)
+  }
+}
+
 module.exports = {
   getClassInfo,
   deleteMessage,
@@ -371,5 +505,12 @@ module.exports = {
   react,
   reply,
   star,
-  unstar
+  unstar,
+  pinMessage,
+  unpinMessage,
+  getReactions,
+  editMessage,
+  getGroupMentions,
+  getPollVotes,
+  vote
 }

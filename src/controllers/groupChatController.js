@@ -337,6 +337,33 @@ const deletePicture = async (req, res) => {
   }
 }
 
+/**
+ * Sets add-members admins-only status of a group chat.
+ *
+ * @async
+ * @function setAddMembersAdminsOnly
+ * @param {Object} req - Request object.
+ * @param {Object} res - Response object.
+ * @param {string} req.params.sessionId - ID of the user's session.
+ * @param {Object} req.body - Request body.
+ * @param {string} req.body.chatId - ID of the group chat.
+ * @param {boolean} req.body.adminsOnly - Desired admins-only status.
+ * @returns {Promise<void>} Promise representing the success or failure of the operation.
+ * @throws {Error} If the chat is not a group.
+ */
+const setAddMembersAdminsOnly = async (req, res) => {
+  try {
+    const { chatId, adminsOnly } = req.body
+    const client = sessions.get(req.params.sessionId)
+    const chat = await client.getChatById(chatId)
+    if (!chat.isGroup) { throw new Error('The chat is not a group') }
+    const result = await chat.setAddMembersAdminsOnly(adminsOnly)
+    res.json({ success: true, result })
+  } catch (error) {
+    sendErrorResponse(res, 500, error.message)
+  }
+}
+
 module.exports = {
   getClassInfo,
   addParticipants,
@@ -351,5 +378,6 @@ module.exports = {
   setMessagesAdminsOnly,
   setSubject,
   setPicture,
-  deletePicture
+  deletePicture,
+  setAddMembersAdminsOnly
 }

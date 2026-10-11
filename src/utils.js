@@ -19,14 +19,10 @@ const waitForNestedObject = (rootObj, nestedPath, maxWaitTime = 10000, interval 
     const checkObject = () => {
       const nestedObj = nestedPath.split('.').reduce((obj, key) => obj ? obj[key] : undefined, rootObj)
       if (nestedObj) {
-        // Nested object exists, resolve the promise
         resolve()
       } else if (Date.now() - start > maxWaitTime) {
-        // Maximum wait time exceeded, reject the promise
-        console.log('Timed out waiting for nested object')
         reject(new Error('Timeout waiting for nested object'))
       } else {
-        // Nested object not yet created, continue waiting
         setTimeout(checkObject, interval)
       }
     }
@@ -35,7 +31,8 @@ const waitForNestedObject = (rootObj, nestedPath, maxWaitTime = 10000, interval 
 }
 
 const checkIfEventisEnabled = (event) => {
-  return new Promise((resolve, reject) => { if (!disabledCallbacks.includes(event)) { resolve() } })
+  if (disabledCallbacks.includes(event)) return new Promise(() => {})
+  return Promise.resolve()
 }
 
 module.exports = {
