@@ -4,16 +4,12 @@ import { useAuth } from '../AuthContext'
 import { api } from '../api'
 
 export default function Layout() {
-  const { user, apiKey, saveApiKey, logout } = useAuth()
+  const { user, logout } = useAuth()
   const navigate = useNavigate()
   const location = useLocation()
   
   // Mobile sidebar state
   const [mobileDrawerOpen, setMobileDrawerOpen] = useState(false)
-
-  // API Key config modal states
-  const [showKeyModal, setShowKeyModal] = useState(false)
-  const [newKey, setNewKey] = useState('')
 
   // Change password states
   const [showPasswordModal, setShowPasswordModal] = useState(false)
@@ -21,25 +17,6 @@ export default function Layout() {
   const [newPassword, setNewPassword] = useState('')
   const [passwordError, setPasswordError] = useState('')
   const [passwordSuccess, setPasswordSuccess] = useState('')
-
-  // Detect active session from URL path (e.g. /session/:sessionId/...)
-  const match = location.pathname.match(/\/session\/([^/]+)/)
-  const activeSessionId = match ? match[1] : null
-
-  const handleLogout = () => {
-    logout()
-    navigate('/login')
-  }
-
-  const handleChangeKey = () => {
-    setNewKey(apiKey || '')
-    setShowKeyModal(true)
-  }
-
-  const saveKey = () => {
-    saveApiKey(newKey.trim())
-    setShowKeyModal(false)
-  }
 
   const handlePasswordChange = async (e) => {
     e.preventDefault()

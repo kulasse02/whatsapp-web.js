@@ -25,7 +25,6 @@ export function AuthProvider({ children }) {
     localStorage.removeItem('token')
     localStorage.removeItem('username')
     localStorage.removeItem('is_admin')
-    localStorage.removeItem('apiKey')
     setUser(null)
   }
 
